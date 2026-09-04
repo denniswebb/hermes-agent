@@ -1206,9 +1206,14 @@ class ToolRegistry:
         entry = self.get_entry(name)
         return entry.schema if entry else None
 
-    def get_toolset_for_tool(self, name: str) -> Optional[str]:
-        """Return the toolset a tool belongs to, or None."""
-        entry = self.get_entry(name)
+    def get_toolset_for_tool(
+        self,
+        name: str,
+        *,
+        scope: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the active (or requested) scope's toolset for a tool."""
+        entry = self.get_entry(name, scope=scope)
         return entry.toolset if entry else None
 
     def get_emoji(self, name: str, default: str = "⚡") -> str:

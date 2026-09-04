@@ -50,6 +50,7 @@ async def test_reload_mcp_only_touches_requesting_profile(
 ) -> None:
     from gateway.run import GatewayRunner
     from tools import mcp_tool
+    from tools.registry import registry
 
     worker_home = tmp_path / "profiles" / "worker"
     worker_home.mkdir(parents=True)
@@ -76,7 +77,17 @@ async def test_reload_mcp_only_touches_requesting_profile(
 
     def fake_discover() -> list[str]:
         seen.append(("discover", get_hermes_home()))
-        return []
+        registry.register(
+            "mcp__victoriametrics__query",
+            "mcp-victoriametrics",
+            {
+                "name": "mcp__victoriametrics__query",
+                "description": "Query metrics",
+            },
+            lambda **_kwargs: "{}",
+            scope=worker_scope,
+        )
+        return ["mcp__victoriametrics__query"]
 
     monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", fake_shutdown)
     monkeypatch.setattr(mcp_tool, "discover_mcp_tools", fake_discover)
@@ -98,6 +109,8 @@ async def test_reload_mcp_only_touches_requesting_profile(
         ("discover", worker_home),
     ]
     assert "default-srv" not in result
+    assert "1 tool(s) available from 1 server(s)" in result
+    registry.deregister("mcp__victoriametrics__query", scope=worker_scope)
 
 
 def test_deregister_scope_kwarg_targets_overlay_and_keeps_plugin_confinement() -> None:

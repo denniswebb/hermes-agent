@@ -25431,13 +25431,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Compute what changed
             connected_servers = _scoped_server_names()
             if reload_scope is not None:
-                from tools.mcp_tool import _mcp_tool_server_names
-
-                with _lock:
-                    new_tools = [
-                        n for n in new_tools
-                        if _mcp_tool_server_names.get(n) in connected_servers
-                    ]
+                # Tool provenance is scoped too.  Do not read its private
+                # process-wide map by raw name: the same logical MCP server
+                # and generated tool name may exist in several profile
+                # overlays.  The registry is the authoritative answer for
+                # what this profile actually registered.
+                new_tools = [
+                    name for name in new_tools
+                    if registry.snapshot_registration(name, scope=reload_scope)
+                    is not None
+                ]
 
             added = connected_servers - old_servers
             removed = old_servers - connected_servers
