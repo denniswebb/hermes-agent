@@ -79,6 +79,37 @@ class TestCronStatusHeartbeatGuard:
         assert "⚠" not in stdout
 
 
+class TestCronStatusMultiplexerLiveness:
+    """Named profiles inherit cron liveness from the default multiplexer."""
+
+    def _status(self, monkeypatch, capsys, *, multiplexer_running: bool) -> str:
+        from hermes_cli import cron as cron_mod
+
+        with (
+            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
+            patch("hermes_cli.gateway.find_gateway_pids", return_value=[]),
+            patch("gateway.status.is_gateway_runtime_lock_active", return_value=False),
+            patch(
+                "hermes_cli.gateway.named_profile_served_by_running_multiplexer",
+                return_value=multiplexer_running,
+            ),
+            patch("cron.jobs.get_ticker_heartbeat_age", return_value=10),
+            patch("cron.jobs.get_ticker_success_age", return_value=8),
+            patch("cron.jobs.list_jobs", return_value=[]),
+        ):
+            cron_mod.cron_status()
+        return capsys.readouterr().out
+
+    def test_named_profile_multiplexer_reports_running(self, monkeypatch, capsys):
+        stdout = self._status(monkeypatch, capsys, multiplexer_running=True)
+        assert "✓ Gateway is running — cron jobs will fire automatically" in stdout
+        assert "Gateway is not running" not in stdout
+
+    def test_named_profile_without_multiplexer_reports_not_running(self, monkeypatch, capsys):
+        stdout = self._status(monkeypatch, capsys, multiplexer_running=False)
+        assert "✗ Gateway is not running — cron jobs will NOT fire" in stdout
+
+
 class TestGetServicePidsProfileScope:
     """systemd branch must honor ``all_profiles`` and filter by profile."""
 

@@ -392,7 +392,10 @@ def cron_incidents(args) -> int:
 def cron_status():
     """Show cron execution status."""
     from cron.jobs import list_jobs
-    from hermes_cli.gateway import find_gateway_pids
+    from hermes_cli.gateway import (
+        find_gateway_pids,
+        named_profile_served_by_running_multiplexer,
+    )
 
     print()
 
@@ -422,6 +425,7 @@ def cron_status():
 
     pids = find_gateway_pids()
     gateway_alive_via_lock = False
+    gateway_alive_via_multiplexer = False
     if not pids:
         # Same false-alarm class the cronjob tool fixed (#95947): the pid scan
         # can transiently miss a live gateway (just after a restart) while the
@@ -438,7 +442,18 @@ def cron_status():
                     pids = [lock_pid]
         except Exception:
             pass
-    if pids or gateway_alive_via_lock:
+        # A named profile intentionally has no gateway.pid when the default
+        # profile's multiplexer owns its ticker. Reuse the shared probe used by
+        # create/list warnings so status does not emit a contradictory red
+        # false-negative for cron stores the live multiplexer is serving.
+        if not gateway_alive_via_lock:
+            try:
+                gateway_alive_via_multiplexer = (
+                    named_profile_served_by_running_multiplexer()
+                )
+            except Exception:
+                pass
+    if pids or gateway_alive_via_lock or gateway_alive_via_multiplexer:
         # The gateway PROCESS is alive — but the cron ticker THREAD inside it
         # can die silently, or stay alive while every tick fails. Check both
         # the liveness heartbeat and the last-successful-tick marker so we
