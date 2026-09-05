@@ -3859,7 +3859,7 @@ async def get_status(profile: Optional[str] = None):
 
         # Prefer the detailed health endpoint response (has full state) when the
         # local runtime status file is absent or stale (cross-container).
-        runtime = local_runtime
+        runtime = liveness.serving_runtime or local_runtime
         if runtime is None and remote_health_body and remote_health_body.get("gateway_state"):
             runtime = remote_health_body
 
@@ -9615,12 +9615,6 @@ def _messaging_platform_payload(
     profile_home: Optional[Path] = None,
 ) -> dict[str, Any]:
     platform_id = entry["id"]
-    runtime_platforms = runtime.get("platforms") if runtime else {}
-    runtime_platform = (
-        runtime_platforms.get(platform_id, {})
-        if isinstance(runtime_platforms, dict)
-        else {}
-    )
     # Same shared ladder /api/status uses. Before this was unified, the two
     # endpoints disagreed on the same page load — the sidebar strip read
     # "running" (it probed GATEWAY_HEALTH_URL and scoped to the requested
@@ -9644,6 +9638,17 @@ def _messaging_platform_payload(
         runtime_pid_probe=get_runtime_status_running_pid,
     )
     gateway_running = liveness.running
+    # A live multiplex root owns named-profile adapter state under
+    # ``<profile>:<platform>``. The shared resolver projects only the
+    # verified profile's entries, so Channels cannot borrow a root adapter or
+    # hide an adapter failure behind the stale named-profile state file.
+    runtime = liveness.serving_runtime or runtime
+    runtime_platforms = runtime.get("platforms") if runtime else {}
+    runtime_platform = (
+        runtime_platforms.get(platform_id, {})
+        if isinstance(runtime_platforms, dict)
+        else {}
+    )
     env_vars = []
 
     for key in entry["env_vars"]:

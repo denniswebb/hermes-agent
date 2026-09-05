@@ -502,6 +502,92 @@ class TestProfileScopedGateway:
         assert data["gateway_state"] == "running"
         assert data["gateway_platforms"] == {"telegram": {"state": "connected"}}
 
+    def test_multiplex_root_projects_only_target_profile_status_and_channels(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        """Named-profile views use their live multiplex owner's exact status.
+
+        The named state file is a stale clean-stop snapshot, while the root
+        gateway is live and explicitly serves worker_beta. Its adapter failure
+        must remain visible to both dashboard surfaces; root/recon fields from
+        the persisted entry must not reach public ``/api/status``.
+        """
+        import hermes_cli.web_server as web_server
+
+        default_home = isolated_profiles["default"]
+        worker_home = isolated_profiles["worker_beta"]
+        worker_home.joinpath(".env").write_text(
+            "TELEGRAM_BOT_TOKEN=worker-token\n", encoding="utf-8"
+        )
+        worker_home.joinpath("config.yaml").write_text(
+            yaml.safe_dump({"platforms": {"telegram": {"enabled": True}}}),
+            encoding="utf-8",
+        )
+        local_runtime = {"gateway_state": "stopped", "platforms": {}}
+        root_runtime = {
+            "gateway_state": "running",
+            "served_profiles": ["default", "worker_beta"],
+            "platforms": {
+                "worker_beta:telegram": {
+                    "state": "fatal",
+                    "error_code": "credential_collision",
+                    "error_message": "worker token rejected",
+                    "writer_pid": 818,
+                    "writer_start_time": 111.0,
+                },
+                "default:telegram": {"state": "connected"},
+            },
+            "updated_at": "2026-09-04T00:00:00+00:00",
+        }
+        runtimes = {
+            worker_home / "gateway_state.json": local_runtime,
+            default_home / "gateway_state.json": root_runtime,
+        }
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda *a, **k: None)
+        monkeypatch.setattr(
+            web_server, "read_runtime_status", lambda path=None: runtimes.get(path)
+        )
+        monkeypatch.setattr(
+            web_server,
+            "get_runtime_status_running_pid",
+            lambda runtime, *, expected_home=None: (
+                818 if runtime is root_runtime and expected_home == default_home else None
+            ),
+        )
+        monkeypatch.setattr(web_server, "_load_configured_gateway_platforms", lambda: {"telegram"})
+        monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
+
+        status = client.get("/api/status", params={"profile": "worker_beta"})
+        channels = client.get(
+            "/api/messaging/platforms", params={"profile": "worker_beta"}
+        )
+
+        assert status.status_code == 200
+        status_body = status.json()
+        assert status_body["gateway_running"] is True
+        assert status_body["gateway_pid"] == 818
+        assert status_body["gateway_state"] == "running"
+        assert status_body["gateway_platforms"] == {
+            "telegram": {
+                "state": "fatal",
+                "error_code": "credential_collision",
+                "error_message": "worker token rejected",
+            }
+        }
+        assert "writer_pid" not in status_body["gateway_platforms"]["telegram"]
+        assert "writer_start_time" not in status_body["gateway_platforms"]["telegram"]
+
+        assert channels.status_code == 200
+        telegram = next(
+            platform
+            for platform in channels.json()["platforms"]
+            if platform["id"] == "telegram"
+        )
+        assert telegram["gateway_running"] is True
+        assert telegram["state"] == "fatal"
+        assert telegram["error_code"] == "credential_collision"
+
     def test_status_keeps_fatal_platforms_on_startup_failed(
         self, client, isolated_profiles, monkeypatch
     ):

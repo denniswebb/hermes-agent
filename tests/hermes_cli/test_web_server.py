@@ -713,7 +713,7 @@ class TestWebServerEndpoints:
             return None
 
         def _runtime(path=None):
-            seen["status_path"] = path
+            seen.setdefault("status_paths", []).append(path)
             return None
 
         def _runtime_pid(runtime=None, *, expected_home=None):
@@ -730,7 +730,11 @@ class TestWebServerEndpoints:
 
         assert resp.status_code == 200
         assert seen["pid_path"] == worker_home / "gateway.pid"
-        assert seen["status_path"] == worker_home / "gateway_state.json"
+        assert seen["status_paths"][0] == worker_home / "gateway_state.json"
+        assert all(
+            path == worker_home.parent.parent / "gateway_state.json"
+            for path in seen["status_paths"][1:]
+        )
         assert seen["expected_home"] == worker_home
 
 

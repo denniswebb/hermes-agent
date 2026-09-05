@@ -1389,7 +1389,7 @@ class TestResolveGatewayLiveness:
             return None
 
         def _reader(path=None):
-            seen["status_path"] = path
+            seen.setdefault("status_paths", []).append(path)
             return None
 
         def _runtime_pid(runtime, *, expected_home=None):
@@ -1405,10 +1405,107 @@ class TestResolveGatewayLiveness:
         )
 
         assert seen["pid_path"] == profile_dir / "gateway.pid"
-        assert seen["status_path"] == profile_dir / "gateway_state.json"
+        assert seen["status_paths"] == [
+            profile_dir / "gateway_state.json",
+            tmp_path / "gateway_state.json",
+        ]
         # expected_home is what stops a recycled PID belonging to another
         # profile's live gateway from being reported as this profile's.
         assert seen["expected_home"] == profile_dir
+
+    def test_named_profile_without_local_runtime_uses_explicit_live_root(self, tmp_path):
+        """No named state file cannot negate a verified multiplex owner."""
+        profile_dir = tmp_path / "profiles" / "coder"
+        profile_dir.mkdir(parents=True)
+        local_runtime = None
+        root_runtime = {
+            "gateway_state": "running",
+            "served_profiles": ["default", "coder"],
+            "platforms": {
+                "coder:telegram": {
+                    "state": "fatal",
+                    "error_code": "credential_collision",
+                },
+                "default:telegram": {"state": "connected"},
+                "reviewer:discord": {"state": "connected"},
+            },
+        }
+        health_calls = []
+
+        result = status.resolve_gateway_liveness(
+            profile_dir=profile_dir,
+            runtime=local_runtime,
+            health_probe=lambda: health_calls.append(True) or (True, {"pid": 9}),
+            pid_probe=lambda *a, **k: None,
+            runtime_reader=lambda path=None: (
+                root_runtime if path == tmp_path / "gateway_state.json" else None
+            ),
+            runtime_pid_probe=lambda runtime, *, expected_home=None: (
+                818 if runtime is root_runtime and expected_home == tmp_path else None
+            ),
+        )
+
+        assert result.running is True
+        assert result.pid == 818
+        assert result.source == "multiplex_runtime_status"
+        assert result.serving_runtime == {
+            **root_runtime,
+            "platforms": {
+                "telegram": {
+                    "state": "fatal",
+                    "error_code": "credential_collision",
+                }
+            },
+        }
+        assert health_calls == []
+
+    def test_named_profile_rejects_unserved_or_dead_multiplex_owner(self, tmp_path):
+        """Neither an unrelated live root nor generic HTTP health proves ownership."""
+        profile_dir = tmp_path / "profiles" / "coder"
+        profile_dir.mkdir(parents=True)
+        local_runtime = {"gateway_state": "stopped"}
+        health_calls = []
+
+        for root_runtime, root_pid in (
+            ({"gateway_state": "running", "served_profiles": ["default", "reviewer"]}, 818),
+            ({"gateway_state": "running", "served_profiles": ["default", "coder"]}, None),
+        ):
+            result = status.resolve_gateway_liveness(
+                profile_dir=profile_dir,
+                runtime=local_runtime,
+                health_probe=lambda: health_calls.append(True) or (True, {"pid": 9}),
+                pid_probe=lambda *a, **k: None,
+                runtime_reader=lambda path=None, root_runtime=root_runtime: (
+                    root_runtime if path == tmp_path / "gateway_state.json" else None
+                ),
+                runtime_pid_probe=lambda runtime, *, expected_home=None, root_runtime=root_runtime, root_pid=root_pid: (
+                    root_pid if runtime is root_runtime and expected_home == tmp_path else None
+                ),
+            )
+            assert result.running is False
+            assert result.source == "none"
+
+        assert health_calls == []
+
+    def test_named_profile_keeps_its_own_live_standalone_gateway(self, tmp_path):
+        profile_dir = tmp_path / "profiles" / "coder"
+        profile_dir.mkdir(parents=True)
+        local_runtime = {"gateway_state": "running", "pid": 42}
+
+        result = status.resolve_gateway_liveness(
+            profile_dir=profile_dir,
+            runtime=local_runtime,
+            health_probe=lambda: pytest.fail("named profile must not borrow health"),
+            pid_probe=lambda *a, **k: None,
+            runtime_reader=lambda path=None: None,
+            runtime_pid_probe=lambda runtime, *, expected_home=None: (
+                42 if runtime is local_runtime and expected_home == profile_dir else None
+            ),
+        )
+
+        assert result.running is True
+        assert result.pid == 42
+        assert result.source == "runtime_status"
 
 
 def test_strict_gateway_identity_returns_none_for_confirmed_absence(tmp_path):

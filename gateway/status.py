@@ -1409,6 +1409,56 @@ class GatewayLiveness:
     source: str
     health_body: Optional[dict[str, Any]] = None
     probe_error: bool = False
+    serving_runtime: Optional[dict[str, Any]] = None
+
+
+def _multiplex_root_and_profile(profile_dir: Optional[Path]) -> tuple[Optional[Path], Optional[str]]:
+    """Return the root gateway home and profile label for a named profile.
+
+    A multiplex gateway owns the root ``gateway_state.json`` and records the
+    exact profile labels it serves there.  A directory outside the canonical
+    ``<root>/profiles/<name>`` layout cannot make that claim, so it gets no
+    multiplex fallback.
+    """
+    if profile_dir is None or profile_dir.parent.name != "profiles":
+        return None, None
+    profile = _profile_label_for_home(profile_dir)
+    if profile is None or profile == "default":
+        return None, None
+    return profile_dir.parent.parent, profile
+
+
+def _runtime_serves_profile(runtime: Optional[dict[str, Any]], profile: str) -> bool:
+    """Whether a root runtime record explicitly covers ``profile``."""
+    if not isinstance(runtime, dict):
+        return False
+    served_profiles = runtime.get("served_profiles")
+    return isinstance(served_profiles, list) and profile in served_profiles
+
+
+def runtime_for_served_profile(
+    runtime: Optional[dict[str, Any]], profile: str
+) -> Optional[dict[str, Any]]:
+    """Project a multiplex root runtime record into one named-profile view.
+
+    Multiplex adapters persist their status as ``<profile>:<platform>`` in the
+    root record.  The profile dashboard and Channels APIs consume the ordinary
+    platform key, so expose only entries belonging to the verified profile.
+    The returned shallow copy deliberately preserves the normal runtime
+    fields while avoiding root/default adapter state in a named profile view.
+    """
+    if not _runtime_serves_profile(runtime, profile):
+        return None
+    assert isinstance(runtime, dict)  # narrowed by _runtime_serves_profile
+    projected = dict(runtime)
+    platforms = runtime.get("platforms")
+    prefix = f"{profile}:"
+    projected["platforms"] = {
+        key[len(prefix):]: value
+        for key, value in platforms.items()
+        if isinstance(key, str) and key.startswith(prefix)
+    } if isinstance(platforms, dict) else {}
+    return projected
 
 
 def resolve_gateway_liveness(
@@ -1438,10 +1488,16 @@ def resolve_gateway_liveness(
     1. **PID file + runtime lock** — scoped to ``profile_dir`` when given.
        Cached by default (``use_cache``); high-frequency polling must not
        churn file descriptors re-flocking ``gateway.lock`` on every request.
-    2. **HTTP health probe** — supplied by the caller (the dashboard owns the
-       deprecated ``GATEWAY_HEALTH_URL`` config).  Covers the gateway running
-       in another container where no local PID is visible.
-    3. **Runtime status PID** — validated against the live process table with
+    2. **Named profile runtime** — a valid profile-owned PID keeps standalone
+       gateways working without consulting a root record.
+    3. **Multiplex root runtime** — for a named profile, a root record must
+       explicitly list that profile in ``served_profiles`` and its PID
+       must validate as the root gateway.  A generic healthy root is never
+       enough to claim an arbitrary profile.
+    4. **HTTP health probe** — supplied by the caller (the dashboard owns the
+       deprecated ``GATEWAY_HEALTH_URL`` config).  It only establishes an
+       unscoped/default gateway; it cannot prove named-profile ownership.
+    5. **Runtime status PID** — validated against the live process table with
        ``expected_home`` so a recycled PID belonging to a *different*
        profile's gateway is never reported as this one's.
 
@@ -1478,8 +1534,60 @@ def resolve_gateway_liveness(
     if pid is not None:
         return GatewayLiveness(running=True, pid=pid, source="pid")
 
+    multiplex_root, profile_name = _multiplex_root_and_profile(profile_dir)
+    # A named profile's own runtime record can establish a legitimate
+    # standalone gateway. Read it before considering the root multiplex
+    # fallback; an absent local record cannot prove standalone ownership but
+    # does not weaken an independently verified root multiplex owner.
+    if profile_dir is not None and runtime is _UNSET:
+        try:
+            runtime = _runtime_reader(path=profile_dir / "gateway_state.json")
+        except Exception:
+            runtime = None
+            probe_error = True
+    if profile_dir is not None and runtime is not _UNSET:
+        try:
+            runtime_pid = _runtime_pid_probe(runtime, expected_home=profile_dir)
+        except Exception:
+            runtime_pid = None
+            probe_error = True
+        if runtime_pid is not None:
+            return GatewayLiveness(
+                running=True,
+                pid=runtime_pid,
+                source="runtime_status",
+            )
+
+    if multiplex_root is not None and profile_name is not None:
+        try:
+            root_runtime = _runtime_reader(
+                path=multiplex_root / "gateway_state.json"
+            )
+        except Exception:
+            root_runtime = None
+            probe_error = True
+        if _runtime_serves_profile(root_runtime, profile_name):
+            try:
+                root_pid = _runtime_pid_probe(
+                    root_runtime, expected_home=multiplex_root
+                )
+            except Exception:
+                root_pid = None
+                probe_error = True
+            if root_pid is not None:
+                return GatewayLiveness(
+                    running=True,
+                    pid=root_pid,
+                    source="multiplex_runtime_status",
+                    serving_runtime=runtime_for_served_profile(
+                        root_runtime, profile_name
+                    ),
+                )
+
     health_body: Optional[dict[str, Any]] = None
-    if health_probe is not None:
+    # A health endpoint proves only that *a* gateway answers. It has no
+    # per-profile ownership contract, so a named profile must not borrow it.
+    if health_probe is not None and profile_name is None:
         try:
             alive, health_body = health_probe()
         except Exception:
@@ -1495,22 +1603,23 @@ def resolve_gateway_liveness(
                 health_body=health_body,
             )
 
+    if profile_dir is not None:
+        return GatewayLiveness(
+            running=False,
+            pid=None,
+            source="none",
+            health_body=health_body,
+            probe_error=probe_error,
+        )
+
     if runtime is _UNSET:
         try:
-            runtime = (
-                _runtime_reader(path=profile_dir / "gateway_state.json")
-                if profile_dir is not None
-                else _runtime_reader()
-            )
+            runtime = _runtime_reader()
         except Exception:
             runtime = None
             probe_error = True
     try:
-        runtime_pid = (
-            _runtime_pid_probe(runtime, expected_home=profile_dir)
-            if profile_dir is not None
-            else _runtime_pid_probe(runtime)
-        )
+        runtime_pid = _runtime_pid_probe(runtime)
     except Exception:
         runtime_pid = None
         probe_error = True
